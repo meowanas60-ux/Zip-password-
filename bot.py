@@ -258,7 +258,7 @@ def get_wordlists() -> list:
                 size_mb = os.path.getsize(path) / 1024 / 1024
                 available.append(path)
                 logger.info(f"✅ Wordlist: {path.split('/')[-1]} ({size_mb:.1f}MB)")
-            except:
+            except Exception:
                 pass
     
     return available
@@ -269,63 +269,7 @@ async def recover_zip_password(zip_file: str, user_id: int) -> tuple:
     try:
         logger.info(f"🔍 Starting recovery: {zip_file} (User: {user_id})")
         
-        wordlists = get_wordlists()
-        if not wordlists:
-            logger.error("❌ কোনো wordlist পাওয়া যায়নি")
-            return None, "wordlist_not_found"
-        
-        # ===================== METHOD 1: zip2john + john =====================
-        logger.info(f"📋 Method 1: John The Ripper ({len(wordlists)} wordlists)")
-        
-        for idx, wordlist in enumerate(wordlists, 1):
-            logger.info(f"🔑 Wordlist {idx}/{len(wordlists)}: {wordlist.split('/')[-1]}")
-            
-            try:
-                # Hash বের করুন
-                result = subprocess.run(
-                    ['zip2john', zip_file],
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                
-                if result.returncode != 0:
-                    logger.warning(f"⚠️ zip2john ব্যর্থ")
-                    continue
-                
-                hash_data = result.stdout
-                
-                # John দিয়ে ক্র্যাক করুন
-                john_result = subprocess.run(
-                    ['john', '--wordlist=' + wordlist, '--format=PKZIP', '--show'],
-                    input=hash_data,
-                    capture_output=True,
-                    text=True,
-                    timeout=600
-                )
-                
-                # পাসওয়ার্ড খুঁজুন
-                for line in john_result.stdout.split('\n'):
-                    if ':' in line:
-                        parts = line.split(':')
-                        if len(parts) >= 2:
-                            password = parts[1].strip()
-                            if password and password != '?':
-                                logger.info(f"✅ পাওয়া: {password}")
-                                return password, "success"
-            
-            except subprocess.TimeoutExpired:
-                logger.warning(f"⏱️ {wordlist} টাইমআউট")
-                continue
-            except FileNotFoundError:
-                logger.error(f"❌ john বা zip2john ইনস্টল নেই")
-                return None, "john_not_found"
-            except Exception as e:
-                logger.warning(f"⚠️ Error: {e}")
-                continue
-        
-        # ===================== METHOD 2: Direct ZIP =====================
-        logger.info("📋 Method 2: Direct ZIP Open")
+        # Method 2 First: Direct ZIP Check
         try:
             with zipfile.ZipFile(zip_file, 'r') as zf:
                 zf.testzip()
@@ -334,16 +278,62 @@ async def recover_zip_password(zip_file: str, user_id: int) -> tuple:
         except RuntimeError:
             logger.warning("🔐 ZIP এনক্রিপ্টেড")
         except Exception as e:
-            logger.error(f"❌ Error: {e}")
+            logger.error(f"❌ Error checking zip: {e}")
+
+        wordlists = get_wordlists()
+        if not wordlists:
+            logger.error("❌ কোনো wordlist পাওয়া যায়নি")
+            return None, "wordlist_not_found"
         
-        logger.error("❌ পাসওয়ার্ড পাওয়া যায়নি")
+        # Hash বের করুন
+        hash_file = f"{zip_file}.hash"
+        try:
+            with open(hash_file, "w") as f:
+                res = subprocess.run(['zip2john', zip_file], capture_output=True, text=True, timeout=30)
+                if res.returncode != 0 or not res.stdout:
+                    return None, "zip2john_failed"
+                f.write(res.stdout)
+        except FileNotFoundError:
+            return None, "john_not_found"
+        
+        # Method 1: John Cracking
+        for wordlist in wordlists:
+            try:
+                subprocess.run(
+                    ['john', '--wordlist=' + wordlist, hash_file],
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+                
+                show_res = subprocess.run(
+                    ['john', '--show', hash_file],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                
+                for line in show_res.stdout.split('\n'):
+                    if ':' in line and not line.startswith('0 password'):
+                        parts = line.split(':')
+                        if len(parts) >= 2:
+                            password = parts[1].strip()
+                            if password:
+                                return password, "success"
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception as e:
+                logger.warning(f"⚠️ Error with {wordlist}: {e}")
+                continue
+        
         return None, "not_found"
     
     except Exception as e:
         logger.error(f"❌ Fatal Error: {e}")
         return None, "error"
-    
     finally:
+        if os.path.exists(f"{zip_file}.hash"):
+            os.remove(f"{zip_file}.hash")
         gc.collect()
 
 # ===================== TELEGRAM HANDLERS =====================
@@ -363,7 +353,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             member = await context.bot.get_chat_member(channel, user_id)
             if member.status not in [ChatMemberStatus.MEMBER, ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR]:
                 not_joined.append(channel)
-        except:
+        except Exception:
             not_joined.append(channel)
     
     if not_joined:
@@ -386,19 +376,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📖 Help", callback_data="show_help")]
     ]
     
-        await update.message.reply_text(
-        f"""👋 **স্বাগতম {user.first_name}!**
-
-🔐 **ZIP Password Recovery Bot**
-
-✨ কী করতে পারি:
-• ZIP ফাইল আপলোড করুন
-• পাসওয়ার্ড খুঁজে দেব
-
-⚡ **Database: 14+ মিলিয়ন পাসওয়ার্ড**
-🚀 **Advanced Methods + Brute Force**
-
-💾 Max File: 50MB
-⏳ Processing: 2 একসাথে""",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+    text_msg = (
+        f"👋 **স্বাগতম {user.first_name}!**\n\n"
+        f"🔐 **ZIP Password Recovery Bot**\n\n"
+        f"✨ কী করতে পারি:\n"
+        f"• ZIP ফাইল আপলোড করুন\n"
+        f"• পাসওয়ার্ড খুঁজে দেব\n\n"
+        f"⚡ **Database: 14+ মিলিয়ন পাসওয়ার্ড**\n"
+        f"🚀 **Advanced Methods + Brute Force**\n\n"
+        f"💾 Max File: 50MB\n"
+        f"⏳ Processing: 2 একসাথে"
     )
+    
+    await update.message.reply_text(
+        text_msg,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+def main():
+    """Main Function"""
+    init_db()
+    if not TOKEN:
+        logger.error("❌ TELEGRAM_BOT_TOKEN পাওয়া যায়নি!")
+        return
+
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+
+    logger.info("🚀 Bot চালু হয়েছে...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
