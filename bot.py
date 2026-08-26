@@ -1,291 +1,404 @@
 import os
 import logging
-import subprocess
+import sqlite3
 import asyncio
+import subprocess
 import gc
-from pathlib import Path
-from dotenv import load_dotenv
+import json
+import time
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Chat
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.error import TelegramError
-from database import (
-    init_db, add_user, is_vip, give_vip, remove_vip, 
-    get_quota, can_recover, increment_quota, list_all_users, user_exists
-)
+import zipfile
+from pathlib import Path
 
-# লোকাল ডেভ এর জন্য .env লোড করুন (Render এ ignoreড)
 load_dotenv()
 
-# Render Environment Variables থেকে পড়ুন
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-CHANNEL_1 = os.getenv("CHANNEL_1")
-CHANNEL_2 = os.getenv("CHANNEL_2")
-
-# ভ্যালিডেশন
-if not TOKEN or ADMIN_ID == 0 or not CHANNEL_1 or not CHANNEL_2:
-    raise ValueError("❌ Environment variables missing! Render এ সেট করুন।")
-
+# ===================== LOGGING =====================
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# ডিরেক্টরি তৈরি করুন
+# ===================== CONFIG =====================
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "7701549179"))
+CHANNEL_1 = os.getenv("CHANNEL_1", "@sahatanas")
+CHANNEL_2 = os.getenv("CHANNEL_2", "@sahatanass")
+
+MAX_FILE_SIZE = 50 * 1024 * 1024
 UPLOAD_DIR = "uploaded_zips"
+DB_PATH = "users.db"
+
 Path(UPLOAD_DIR).mkdir(exist_ok=True)
 
-# ডাটাবেস ইনিশিয়ালাইজ করুন
-init_db()
+# ===================== SEMAPHORE =====================
+processing_semaphore = asyncio.Semaphore(2)
 
-# Semaphore (RAM safe)
-RECOVERY_SEMAPHORE = asyncio.Semaphore(2)
-
-# ========== HELPER FUNCTIONS ==========
-
-async def is_member_of_channels(app, user_id):
-    """চ্যানেল মেম্বার চেক"""
-    try:
-        member_1 = await app.bot.get_chat_member(CHANNEL_1, user_id)
-        status_1 = member_1.status in ['member', 'administrator', 'creator']
-        
-        member_2 = await app.bot.get_chat_member(CHANNEL_2, user_id)
-        status_2 = member_2.status in ['member', 'administrator', 'creator']
-        
-        return status_1 and status_2
-    except TelegramError:
-        return False
-
-async def force_join_keyboard():
-    """Force join কীবোর্ড"""
-    keyboard = [
-        [InlineKeyboardButton("📢 চ্যানেল ১", url=f"https://t.me/{CHANNEL_1[1:]}"),
-         InlineKeyboardButton("📢 চ্যানেল २", url=f"https://t.me/{CHANNEL_2[1:]}")],
-        [InlineKeyboardButton("✅ যাচাই করুন", callback_data="verify_membership")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def test_zip_password(zip_file_path, password):
-    """পাসওয়ার্ড টেস্ট"""
-    try:
-        cmd = subprocess.run(
-            ['unzip', '-t', '-P', password, zip_file_path],
-            capture_output=True,
-            text=True,
-            timeout=10
+# ===================== DATABASE FUNCTIONS =====================
+def init_db():
+    """ডাটাবেস ইনিশিয়ালাইজ"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            is_vip INTEGER DEFAULT 0,
+            recovery_count INTEGER DEFAULT 0,
+            last_recovery TIMESTAMP,
+            total_recoveries INTEGER DEFAULT 0,
+            blocked INTEGER DEFAULT 0,
+            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        return cmd.returncode == 0
-    except:
-        return False
+    ''')
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS admin_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER,
+            action TEXT,
+            target_user_id INTEGER,
+            details TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS recovery_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            filename TEXT,
+            password TEXT,
+            status TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    logger.info("✅ ডাটাবেস প্রস্তুত")
 
-def recover_zip_password(zip_file_path):
-    """ZIP পাসওয়ার্ড রিকভার"""
+def register_user(user_id: int, username: str):
+    """নতুন ইউজার রেজিস্টার"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        INSERT OR IGNORE INTO users (user_id, username, join_date)
+        VALUES (?, ?, ?)
+    ''', (user_id, username, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_user_quota(user_id: int) -> dict:
+    """ইউজারের কোটা চেক"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('SELECT is_vip, recovery_count, last_recovery, blocked FROM users WHERE user_id = ?', (user_id,))
+    result = c.fetchone()
+    conn.close()
+    
+    if not result:
+        return {"can_recover": True, "remaining": 1, "is_vip": False, "blocked": False}
+    
+    is_vip, count, last_recovery, blocked = result
+    
+    if blocked:
+        return {"can_recover": False, "remaining": 0, "is_vip": False, "blocked": True}
+    
+    if last_recovery:
+        last_time = datetime.fromisoformat(last_recovery)
+        if datetime.now() - last_time > timedelta(hours=24):
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute('UPDATE users SET recovery_count = 0 WHERE user_id = ?', (user_id,))
+            conn.commit()
+            conn.close()
+            count = 0
+    
+    max_quota = 3 if is_vip else 1
+    can_recover = count < max_quota
+    remaining = max_quota - count
+    
+    return {"can_recover": can_recover, "remaining": remaining, "is_vip": is_vip, "blocked": False}
+
+def update_recovery_count(user_id: int):
+    """Recovery count বাড়ান"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        UPDATE users SET 
+        recovery_count = recovery_count + 1, 
+        last_recovery = ?,
+        total_recoveries = total_recoveries + 1 
+        WHERE user_id = ?
+    ''', (datetime.now().isoformat(), user_id))
+    conn.commit()
+    conn.close()
+
+def save_recovery_history(user_id: int, filename: str, password: str, status: str):
+    """রিকভারি হিস্টরি সেভ করুন"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO recovery_history (user_id, filename, password, status)
+        VALUES (?, ?, ?, ?)
+    ''', (user_id, filename, password, status))
+    conn.commit()
+    conn.close()
+
+def add_admin_log(admin_id: int, action: str, target_user: int, details: str = ""):
+    """Admin লগ সেভ করুন"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO admin_logs (admin_id, action, target_user_id, details)
+        VALUES (?, ?, ?, ?)
+    ''', (admin_id, action, target_user, details))
+    conn.commit()
+    conn.close()
+
+def is_admin(user_id: int) -> bool:
+    """অ্যাডমিন চেক করুন"""
+    return user_id == ADMIN_ID
+
+def block_user(user_id: int):
+    """ইউজার ব্লক করুন"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('UPDATE users SET blocked = 1 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def unblock_user(user_id: int):
+    """ইউজার আনব্লক করুন"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('UPDATE users SET blocked = 0 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def make_vip(user_id: int):
+    """VIP বানান"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('UPDATE users SET is_vip = 1 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def remove_vip(user_id: int):
+    """VIP সরান"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('UPDATE users SET is_vip = 0 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_all_users():
+    """সব ইউজার পান"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT user_id, username, is_vip, total_recoveries, blocked FROM users ORDER BY join_date DESC')
+    users = c.fetchall()
+    conn.close()
+    return users
+
+def get_stats():
+    """স্ট্যাটিসটিক্স পান"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('SELECT COUNT(*) FROM users')
+    total_users = c.fetchone()[0]
+    
+    c.execute('SELECT COUNT(*) FROM users WHERE is_vip = 1')
+    vip_users = c.fetchone()[0]
+    
+    c.execute('SELECT COUNT(*) FROM users WHERE blocked = 1')
+    blocked_users = c.fetchone()[0]
+    
+    c.execute('SELECT SUM(total_recoveries) FROM users')
+    total_recovery = c.fetchone()[0] or 0
+    
+    c.execute('SELECT COUNT(*) FROM recovery_history WHERE status = "success"')
+    successful = c.fetchone()[0]
+    
+    conn.close()
+    
+    return {
+        "total_users": total_users,
+        "vip_users": vip_users,
+        "blocked_users": blocked_users,
+        "total_recovery": total_recovery,
+        "successful": successful
+    }
+
+# ===================== WORDLIST =====================
+def get_wordlists() -> list:
+    """সব উপলব্ধ wordlist পান"""
+    wordlists = [
+        "/usr/share/wordlists/rockyou.txt",
+        "/usr/share/wordlists/rockyou-50.txt",
+        "/usr/share/wordlists/wordlist.txt",
+        "/usr/share/dict/american-english",
+        "/usr/share/dict/words",
+        "/usr/share/dict/cracklib-small"
+    ]
+    
+    available = []
+    for path in wordlists:
+        if os.path.exists(path):
+            try:
+                size_mb = os.path.getsize(path) / 1024 / 1024
+                available.append(path)
+                logger.info(f"✅ Wordlist: {path.split('/')[-1]} ({size_mb:.1f}MB)")
+            except:
+                pass
+    
+    return available
+
+# ===================== PASSWORD RECOVERY =====================
+async def recover_zip_password(zip_file: str, user_id: int) -> tuple:
+    """ZIP পাসওয়ার্ড রিকভার করুন"""
     try:
-        logger.info(f"🔍 রিকভারি শুরু: {zip_file_path}")
+        logger.info(f"🔍 Starting recovery: {zip_file} (User: {user_id})")
         
-        common_passwords = [
-            "123456", "password", "123456789", "12345678", "12345",
-            "1234567", "password123", "123123", "1234567890",
-            "000000", "111111", "admin", "admin123", "root",
-            "toor", "pass", "test", "guest", "info", "master",
-            "welcome", "letmein", "qwerty", "abc123", "123abc"
-        ]
+        wordlists = get_wordlists()
+        if not wordlists:
+            logger.error("❌ কোনো wordlist পাওয়া যায়নি")
+            return None, "wordlist_not_found"
         
-        # সাধারণ পাসওয়ার্ড চেষ্টা
-        for pwd in common_passwords:
-            if test_zip_password(zip_file_path, pwd):
-                logger.info(f"✅ পাওয়া: {pwd}")
-                return pwd
+        # ===================== METHOD 1: zip2john + john =====================
+        logger.info(f"📋 Method 1: John The Ripper ({len(wordlists)} wordlists)")
         
-        # john ব্যবহার করুন
-        try:
-            zip2john_cmd = subprocess.run(
-                ['zip2john', zip_file_path],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
+        for idx, wordlist in enumerate(wordlists, 1):
+            logger.info(f"🔑 Wordlist {idx}/{len(wordlists)}: {wordlist.split('/')[-1]}")
             
-            if zip2john_cmd.returncode == 0:
-                hash_data = zip2john_cmd.stdout
+            try:
+                # Hash বের করুন
+                result = subprocess.run(
+                    ['zip2john', zip_file],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
                 
-                john_cmd = subprocess.run(
-                    ['john', '--wordlist=/usr/share/wordlists/rockyou.txt', 
-                     '--format=PKZIP', '--show'],
+                if result.returncode != 0:
+                    logger.warning(f"⚠️ zip2john ব্যর্থ")
+                    continue
+                
+                hash_data = result.stdout
+                
+                # John দিয়ে ক্র্যাক করুন
+                john_result = subprocess.run(
+                    ['john', '--wordlist=' + wordlist, '--format=PKZIP', '--show'],
                     input=hash_data,
                     capture_output=True,
                     text=True,
-                    timeout=300
+                    timeout=600
                 )
                 
-                for line in john_cmd.stdout.split('\n'):
+                # পাসওয়ার্ড খুঁজুন
+                for line in john_result.stdout.split('\n'):
                     if ':' in line:
                         parts = line.split(':')
                         if len(parts) >= 2:
                             password = parts[1].strip()
-                            if password and test_zip_password(zip_file_path, password):
+                            if password and password != '?':
                                 logger.info(f"✅ পাওয়া: {password}")
-                                return password
-        except FileNotFoundError:
-            logger.warning("⚠️ John না পাওয়া - Render এ ইনস্টল করুন")
-        except subprocess.TimeoutExpired:
-            logger.error("⏱️ টাইমআউট")
+                                return password, "success"
+            
+            except subprocess.TimeoutExpired:
+                logger.warning(f"⏱️ {wordlist} টাইমআউট")
+                continue
+            except FileNotFoundError:
+                logger.error(f"❌ john বা zip2john ইনস্টল নেই")
+                return None, "john_not_found"
+            except Exception as e:
+                logger.warning(f"⚠️ Error: {e}")
+                continue
         
-        return None
+        # ===================== METHOD 2: Direct ZIP =====================
+        logger.info("📋 Method 2: Direct ZIP Open")
+        try:
+            with zipfile.ZipFile(zip_file, 'r') as zf:
+                zf.testzip()
+                logger.info("✅ পাসওয়ার্ড ছাড়াই খোলা যায়")
+                return "", "no_password"
+        except RuntimeError:
+            logger.warning("🔐 ZIP এনক্রিপ্টেড")
+        except Exception as e:
+            logger.error(f"❌ Error: {e}")
         
+        logger.error("❌ পাসওয়ার্ড পাওয়া যায়নি")
+        return None, "not_found"
+    
     except Exception as e:
-        logger.error(f"❌ Error: {e}")
-        return None
+        logger.error(f"❌ Fatal Error: {e}")
+        return None, "error"
+    
+    finally:
+        gc.collect()
 
-def cleanup_file(file_path):
-    """ফাইল ডিলিট করুন"""
-    try:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            gc.collect()
-            logger.info(f"🗑️ ডিলিট: {file_path}")
-    except Exception as e:
-        logger.error(f"Cleanup Error: {e}")
-
-# ========== COMMAND HANDLERS ==========
+# ===================== TELEGRAM HANDLERS =====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """স্টার্ট"""
+    """Start Command"""
     user = update.effective_user
     user_id = user.id
+    username = user.username or "Unknown"
     
-    if not user_exists(user_id):
-        add_user(user_id, user.username or "N/A", user.first_name or "User")
+    register_user(user_id, username)
     
-    is_member = await is_member_of_channels(context.application, user_id)
-    
-    if not is_member:
-        await update.message.reply_text(
-            f"🔒 **চ্যানেলে যোগ দিন!**\n\n"
-            f"🔗 {CHANNEL_1}\n"
-            f"🔗 {CHANNEL_2}\n\n"
-            f"তারপর ✅ যাচাই করুন",
-            reply_markup=await force_join_keyboard(),
-            parse_mode="Markdown"
-        )
-        return
-    
-    vip_status = "🌟 VIP (3/দিন)" if is_vip(user_id) else "📌 Free (1/দিন)"
-    
-    await update.message.reply_text(
-        f"🔓 আলাই {user.first_name}! 👋\n\n"
-        f"📊 স্ট্যাটাস: {vip_status}\n\n"
-        f"💡 কমান্ড:\n"
-        f"/recover - শুরু করুন\n"
-        f"/help - সাহায্য\n"
-        f"/status - স্ট্যাটাস",
-        parse_mode="Markdown"
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """সাহায্য"""
-    await update.message.reply_text(
-        "📖 **কীভাবে ব্যবহার করব:**\n\n"
-        "1️⃣ /recover কমান্ড দিন\n"
-        "2️⃣ ZIP ফাইল পাঠান\n"
-        "3️⃣ অপেক্ষা করুন (1-5 মিনিট)\n"
-        "4️⃣ পাসওয়ার্ড পান ✅\n\n"
-        "**সীমা:**\n"
-        "📌 Free: 1/দিন\n"
-        "🌟 VIP: 3/দিন",
-        parse_mode="Markdown"
-    )
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """স্ট্যাটাস"""
-    user_id = update.effective_user.id
-    vip_status = "🌟 VIP" if is_vip(user_id) else "📌 Free"
-    quota = get_quota(user_id)
-    limit = 3 if is_vip(user_id) else 1
-    
-    await update.message.reply_text(
-        f"📊 **আপনার স্ট্যাটাস:**\n\n"
-        f"স্ট্যাটাস: {vip_status}\n"
-        f"আজ ব্যবহার: {quota}/{limit}\n"
-        f"বাকি: {limit - quota}\n\n"
-        f"Admin: /start এ ক্লিক করুন",
-        parse_mode="Markdown"
-    )
-
-async def recover_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """রিকভার শুরু"""
-    user_id = update.effective_user.id
-    
-    is_member = await is_member_of_channels(context.application, user_id)
-    if not is_member:
-        await update.message.reply_text("🔒 প্রথমে চ্যানেলে যোগ দিন!")
-        return
-    
-    if not can_recover(user_id):
-        limit = 3 if is_vip(user_id) else 1
-        await update.message.reply_text(
-            f"❌ আজকের সীমা শেষ! ({limit}/দিন)\n\n"
-            f"24 ঘণ্টা পর আবার চেষ্টা করুন অথবা VIP হন।",
-            parse_mode="Markdown"
-        )
-        return
-    
-    context.user_data['waiting_for_zip'] = True
-    await update.message.reply_text(
-        "📂 এখন ZIP ফাইল পাঠান (Max 50MB)\n\n"
-        "⏳ রিকভারি 1-5 মিনিট লাগতে পারে..."
-    )
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ডকুমেন্ট হ্যান্ডেল করুন"""
-    user_id = update.effective_user.id
-    
-    if not context.user_data.get('waiting_for_zip'):
-        return
-    
-    document = update.message.document
-    
-    if not document.file_name.endswith('.zip'):
-        await update.message.reply_text("❌ শুধুমাত্র ZIP ফাইল আপলোড করুন!")
-        return
-    
-    if document.file_size > 50 * 1024 * 1024:
-        await update.message.reply_text("❌ ফাইল 50MB এর বেশি!")
-        return
-    
-    async with RECOVERY_SEMAPHORE:
+    # Force join check
+    not_joined = []
+    for channel in [CHANNEL_1, CHANNEL_2]:
         try:
-            await update.message.reply_text("⏳ ডাউনলোড করছি...")
-            
-            file = await context.bot.get_file(document.file_id)
-            file_path = os.path.join(UPLOAD_DIR, document.file_name)
-            await file.download_to_drive(file_path)
-            
-            await update.message.reply_text("🔍 রিকভারি চলছে...")
-            
-            password = recover_zip_password(file_path)
-            
-            if password:
-                increment_quota(user_id, document.file_name, password)
-                await update.message.reply_text(
-                    f"✅ **পাসওয়ার্ড পাওয়া!**\n\n"
-                    f"🔐 `{password}`",
-                    parse_mode="Markdown"
-                )
-            else:
-                await update.message.reply_text(
-                    "❌ পাসওয়ার্ড পাওয়া যায়নি।\n\n"
-                    "সম্ভাবনা:\n"
-                    "• খুব কমপ্লেক্স পাসওয়ার্ড\n"
-                    "• ফাইল কারাপ্ট"
-                )
-            
-            cleanup_file(file_path)
-            
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-            if os.path.exists(file_path):
-                cleanup
+            member = await context.bot.get_chat_member(channel, user_id)
+            if member.status not in [ChatMemberStatus.MEMBER, ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR]:
+                not_joined.append(channel)
+        except:
+            not_joined.append(channel)
+    
+    if not_joined:
+        keyboard = [
+            [InlineKeyboardButton("Channel Join করুন", url=f"https://t.me/{ch.replace('@', '')}")] 
+            for ch in not_joined
+        ]
+        keyboard.append([InlineKeyboardButton("✅ Join করেছি", callback_data="check_join")])
+        
+        await update.message.reply_text(
+            f"❌ আগে এই চ্যানেল join করুন:\n\n" + 
+            "\n".join([f"🔗 {ch}" for ch in not_joined]),
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("🔐 Password Recover", callback_data="start_recover")],
+        [InlineKeyboardButton("📊 My Status", callback_data="show_status")],
+        [InlineKeyboardButton("📖 Help", callback_data="show_help")]
+    ]
+    
+    await update.message.reply_text(
+        f"""👋 **স্বাগতম {user.first_name}!**
+
+🔐 **ZIP Password Recovery Bot**
+
+✨ কী করতে পারি:
+• ZIP ফাইল আপলোড করুন
+• পাসওয়ার্ড খুঁজে দেব
+
+⚡ **Database: 14+ মিলিয়ন পাসওয়ার্ড**
+🚀 **Advanced Methods + Brute Force**
+
+💾 Max File: 50MB
+⏳ Processing: 2 একসাথে
+
+""",
