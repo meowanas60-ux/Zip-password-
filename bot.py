@@ -386,7 +386,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📖 Help", callback_data="show_help")]
     ]
     
-    await update.message.reply_text(
+        await update.message.reply_text(
         f"""👋 **স্বাগতম {user.first_name}!**
 
 🔐 **ZIP Password Recovery Bot**
@@ -399,6 +399,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🚀 **Advanced Methods + Brute Force**
 
 💾 Max File: 50MB
-⏳ Processing: 2 একসাথে
-
-""",
+⏳ Processing: 2 একসাথে""",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
